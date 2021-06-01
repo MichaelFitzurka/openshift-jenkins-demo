@@ -18,6 +18,10 @@ parameters:
   value: stage
   name: STAGE_PROJECT
   required: true
+- displayName: PROD project name
+  value: prod
+  name: PROD_PROJECT
+  required: true
 - displayName: Ephemeral
   description: Use no persistent storage for Gogs and Nexus
   value: "true"
@@ -29,7 +33,7 @@ parameters:
   name: WEBHOOK_SECRET
   required: true
 - displayName: Integrate Quay.io
-  description: Integrate image build and deployment with Quay.io 
+  description: Integrate image build and deployment with Quay.io
   value: "false"
   name: ENABLE_QUAY
   required: true
@@ -78,103 +82,294 @@ objects:
       type: None
     strategy:
       jenkinsPipelineStrategy:
-        env:
+      env:
+        - name: APP_NAME
+          value: tasks
+        - name: CHECKMARX_GROUP
+          value: 22222222-2222-448d-b029-989c9070eb23
+        - name: CHECKMARX_URL
+          value: 'https://checkmarx-cxsast.demo-dlt.com/'
         - name: DEV_PROJECT
-          value: ${DEV_PROJECT}
+          value: dev-dlt-ssf
+        - name: DOCUMENT_SITE
+          value: 'true'
+        - name: GIT_BRANCH
+          value: master
+        - name: GIT_URL
+          value: 'https://github-enterprise.demo-dlt.com/user2/openshift-tasks.git'
         - name: STAGE_PROJECT
-          value: ${STAGE_PROJECT}
+          value: stage-dlt-ssf
         - name: ENABLE_QUAY
-          value: ${ENABLE_QUAY}
+          value: 'false'
+        - name: ROCKET_CHAT_CHANNEL
+          value: user2-builds
+        - name: ROCKET_CHAT_URL
+          value: 'http://rocketchat-rocketchat-rocket-chat.apps.dltssf2.workshop-dlt.com'
+        - name: USER
+          value: user2
         jenkinsfile: |-
-          def mvnCmd = "mvn -s configuration/cicd-settings-nexus3.xml"
+        def mvnCmd = "mvn --batch-mode -s configuration/cicd-settings-nexus3.xml -Duser=${env.USER}"
 
-          pipeline {
-            agent {
-              label 'maven'
+        pipeline {
+          agent {
+            label 'maven'
+          }
+          options {
+            timeout(time: 20, unit: 'MINUTES')
+          }
+          parameters {
+            credentials(
+              credentialType: 'com.openshift.jenkins.plugins.OpenShiftTokenCredentials',
+              defaultValue: "openshift-${env.USER}",
+              description: 'OpenShift Credential for User',
+              name: 'OPENSHIFT_USER_CRED',
+              required: true
+            )
+          }
+          stages {
+            stage('Initialize Pipeline') {
+              steps {
+                echo 'Initialize Pipeline'
+                rocketSend(
+                  serverUrl: env.ROCKET_CHAT_URL,
+                  channel: env.ROCKET_CHAT_CHANNEL,
+                  rawMessage: true,
+                  message: "**#${env.BUILD_NUMBER} Pipeline Started** :exclamation: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)"
+                )
+              }
             }
-            stages {
-              stage('Build App') {
-                steps {
-                  git branch: 'eap-7', url: 'http://gogs:3000/gogs/openshift-tasks.git'
-                  sh "${mvnCmd} install -DskipTests=true"
-                }
+            stage('Maven: Build WAR') {
+              steps {
+                echo 'Maven: Build WAR'
+                sh "git config --global http.sslVerify false"
+                git(
+                  branch: env.GIT_BRANCH,
+                  credentialsId: "github-${env.USER}",
+                  url: env.GIT_URL
+                )
+                sh "${mvnCmd} install -DskipTests=true"
               }
-              stage('Test') {
-                steps {
-                  sh "${mvnCmd} test"
-                  step([$class: 'JUnitResultArchiver', testResults: '**/target/surefire-reports/TEST-*.xml'])
-                }
+            }
+            stage('Maven: Unit Test') {
+              steps {
+                echo 'Maven: Unit Test'
+                sh "${mvnCmd} test"
+                junit(
+                  allowEmptyResults: true,
+                  testResults: '**/target/surefire-reports/TEST-*.xml'
+                )
               }
-              stage('Code Analysis') {
-                steps {
-                  script {
-                    sh "${mvnCmd} install sonar:sonar -Dsonar.host.url=http://sonarqube:9000 -DskipTests=true"
+            }
+            stage('Analyze') {
+              parallel {
+                stage('Checkmarx SAST: Analyze Code') {
+                  steps {
+                    echo 'Checkmarx SAST: Analyze Code'
+                    step([
+                      $class: 'CxScanBuilder',
+                      credentialsId: "checkmarx-${env.USER}",
+                      exclusionsSetting: 'global',
+                      failBuildOnNewResults: false,
+                      failBuildOnNewSeverity: 'HIGH',
+                      fullScanCycle: 10,
+                      generatePdfReport: true,
+                      groupId: env.CHECKMARX_GROUP,
+                      isProxy: false,
+                      preset: '36',
+                      projectName: "${env.APP_NAME}-${env.DEV_PROJECT}",
+                      sastEnabled: true,
+                      serverUrl: env.CHECKMARX_URL,
+                      sourceEncoding: '1',
+                      useOwnServerCredentials: true,
+                      vulnerabilityThresholdResult: 'FAILURE',
+                      waitForResultsEnabled: true
+                    ])
+                    archiveArtifacts 'Checkmarx/Reports/*.pdf'
                   }
                 }
-              }
-              stage('Archive App') {
-                steps {
-                  sh "${mvnCmd} deploy -DskipTests=true -P nexus3"
-                }
-              }
-              stage('Build Image') {
-                steps {
-                  sh "cp target/openshift-tasks.war target/ROOT.war"
-                  script {
-                    openshift.withCluster() {
-                      openshift.withProject(env.DEV_PROJECT) {
-                        openshift.selector("bc", "tasks").startBuild("--from-file=target/ROOT.war", "--wait=true")
-                      }
-                    }
+                stage('Nexus IQ: Analyze BOM') {
+                  steps {
+                    echo 'Nexus IQ: Analyze BOM'
+                    nexusPolicyEvaluation(
+                      enableDebugLogging: true,
+                      failBuildOnNetworkError: false,
+                      iqApplication: "${env.APP_NAME}-${env.DEV_PROJECT}",
+                      iqScanPatterns: [[scanPattern: '**/*.*']],
+                      iqStage: 'build',
+                      jobCredentialsId: "nexus_iq_${env.USER}"
+                    )
                   }
                 }
-              }
-              stage('Deploy DEV') {
-                steps {
-                  script {
-                    openshift.withCluster() {
-                      openshift.withProject(env.DEV_PROJECT) {
-                        openshift.selector("dc", "tasks").rollout().latest();
-                      }
-                    }
-                  }
-                }
-              }
-              stage('Promote to STAGE?') {
-                agent {
-                  label 'skopeo'
-                }
-                steps {
-                  timeout(time:15, unit:'MINUTES') {
-                      input message: "Promote to STAGE?", ok: "Promote"
-                  }
-
-                  script {
-                    openshift.withCluster() {
-                      if (env.ENABLE_QUAY.toBoolean()) {
-                        withCredentials([usernamePassword(credentialsId: "${openshift.project()}-quay-cicd-secret", usernameVariable: "QUAY_USER", passwordVariable: "QUAY_PWD")]) {
-                          sh "skopeo copy docker://quay.io/${QUAY_USERNAME}/${QUAY_REPOSITORY}:latest docker://quay.io/${QUAY_USERNAME}/${QUAY_REPOSITORY}:stage --src-creds \"$QUAY_USER:$QUAY_PWD\" --dest-creds \"$QUAY_USER:$QUAY_PWD\" --src-tls-verify=false --dest-tls-verify=false"
-                        }
+                stage('Maven: Document Site') {
+                  steps {
+                    script {
+                      if (env.DOCUMENT_SITE.toBoolean()) {
+                        echo 'Maven: Document Site'
+                        sh "${mvnCmd} jxr:jxr site:site -DskipTests=true"
+                        publishHTML(target: [
+                          reportName: 'Site',
+                          reportDir: 'target/site/apidocs',
+                          reportFiles: 'index-all.html',
+                          keepAll: false
+                        ])
                       } else {
-                        openshift.tag("${env.DEV_PROJECT}/tasks:latest", "${env.STAGE_PROJECT}/tasks:stage")
+                        echo 'Maven: Document Site - skipped'
                       }
                     }
                   }
                 }
               }
-              stage('Deploy STAGE') {
-                steps {
-                  script {
-                    openshift.withCluster() {
-                      openshift.withProject(env.STAGE_PROJECT) {
-                        openshift.selector("dc", "tasks").rollout().latest();
+            }
+            stage('Nexus Repo: Archive WAR') {
+              steps {
+                echo 'Nexus Repo: Archive WAR'
+                sh "${mvnCmd} deploy -DskipTests=true -P nexus"
+              }
+            }
+            stage('OpenShift: Build/Deploy Image to Dev') {
+              steps {
+                echo 'OpenShift: Build/Deploy Image to Dev'
+                script {
+                  openshift.withCluster() {
+                    openshift.withCredentials("${OPENSHIFT_USER_CRED}") {
+                      openshift.withProject(env.DEV_PROJECT) {
+                        timeout (time: 10, unit: 'MINUTES') {
+                          def bc = openshift.selector('bc', env.APP_NAME)
+                          if (bc.exists()) {
+                            bc.startBuild('--wait=true')
+                          } else {
+                            openshift.create(openshift.process(env.APP_NAME))
+                          }
+                          def dc = openshift.selector('dc', env.APP_NAME)
+                          dc.rollout().status()
+                          dc.related('pods').untilEach {
+                            return it.object().status.phase == 'Running'
+                          }
+                        }
                       }
                     }
                   }
                 }
+                rocketSend(
+                  serverUrl: env.ROCKET_CHAT_URL,
+                  channel: env.ROCKET_CHAT_CHANNEL,
+                  rawMessage: true,
+                  message: "**#${env.BUILD_NUMBER} Deployed to <http://${env.APP_NAME}-${env.DEV_PROJECT}.apps.dltssf2.workshop-dlt.com/|Dev>** :thumbsup: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)"
+                )
+              }
+            }
+            stage('Sysdig: Scan Image') {
+              steps {
+                echo 'Sysdig: Scan Image'
+                writeFile(
+                  file: "sysdig_secure_images",
+                  text: "image-registry.openshift-image-registry.svc:5000/${env.DEV_PROJECT}/${env.APP_NAME}:latest"
+                )
+                sysdig(
+                  bailOnFail: false,
+                  engineCredentialsId: "sysdig-secure-api-credentials",
+                  name: "sysdig_secure_images"
+                )
+              }
+            }
+            stage('Jenkins: Promote to Stage?') {
+              agent {
+                label 'skopeo'
+              }
+              steps {
+                echo 'Jenkins: Promote to Stage?'
+                rocketSend(
+                  serverUrl: env.ROCKET_CHAT_URL,
+                  channel: env.ROCKET_CHAT_CHANNEL,
+                  rawMessage: true,
+                  message: "**#${env.BUILD_NUMBER} Dev Pipeline Complete - Promote to Stage?** :question: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)"
+                )
+                timeout(time:15, unit:'MINUTES') {
+                  input message: "Promote to STAGE?", ok: "Promote"
+                }
+
+                script {
+                  openshift.withCluster() {
+                    if (env.ENABLE_QUAY.toBoolean()) {
+                      withCredentials([usernamePassword(credentialsId: "${openshift.project()}-quay-cicd-secret", usernameVariable: "QUAY_USER", passwordVariable: "QUAY_PWD")]) {
+                        sh "skopeo copy docker://quay.io//${env.APP_NAME}-app:latest docker://quay.io//${env.APP_NAME}-app:stage --src-creds \"$QUAY_USER:$QUAY_PWD\" --dest-creds \"$QUAY_USER:$QUAY_PWD\" --src-tls-verify=false --dest-tls-verify=false"
+                      }
+                    } else {
+                      openshift.tag("${env.DEV_PROJECT}/${env.APP_NAME}:latest", "${env.STAGE_PROJECT}/${env.APP_NAME}:stage")
+                    }
+                  }
+                }
+              }
+            }
+            stage('OpenShift: Deploy to Stage') {
+              steps {
+                echo 'OpenShift: Deploy to Stage'
+                script {
+                  openshift.withCluster() {
+                    openshift.withCredentials("${OPENSHIFT_USER_CRED}") {
+                      openshift.withProject(env.STAGE_PROJECT) {
+                        def dc = openshift.selector('dc', env.APP_NAME)
+                        dc.rollout().status()
+                        dc.related('pods').untilEach {
+                          return it.object().status.phase == 'Running'
+                        }
+                      }
+                    }
+                  }
+                }
+                rocketSend(
+                  serverUrl: env.ROCKET_CHAT_URL,
+                  channel: env.ROCKET_CHAT_CHANNEL,
+                  rawMessage: true,
+                  message: "**#${env.BUILD_NUMBER} Deployed to <http://${env.APP_NAME}-${env.STAGE_PROJECT}.apps.dltssf2.workshop-dlt.com/|Stage>** :thumbsup: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)"
+                )
               }
             }
           }
+          post {
+            success {
+              echo 'Pipeline Success'
+              rocketSend(
+                serverUrl: env.ROCKET_CHAT_URL,
+                channel: env.ROCKET_CHAT_CHANNEL,
+                rawMessage: true,
+                message: "**#${env.BUILD_NUMBER} Pipeline Success** :100: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)"
+              )
+            }
+            aborted {
+              echo 'Pipeline Aborted'
+              rocketSend(
+                serverUrl: env.ROCKET_CHAT_URL,
+                channel: env.ROCKET_CHAT_CHANNEL,
+                rawMessage: true,
+                message: "**#${env.BUILD_NUMBER} Pipeline Aborted** :no_entry_sign: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)"
+              )
+            }
+            unstable {
+              echo 'Pipeline Unstable'
+              rocketSend(
+                serverUrl: env.ROCKET_CHAT_URL,
+                channel: env.ROCKET_CHAT_CHANNEL,
+                rawMessage: true,
+                message: "**#${env.BUILD_NUMBER} Pipeline Unstable** :confused: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)",
+                avatar: 'https://jenkins.io/images/logos/fire/fire.png'
+              )
+            }
+            failure {
+              echo 'Pipeline Failure'
+              rocketSend(
+                serverUrl: env.ROCKET_CHAT_URL,
+                channel: env.ROCKET_CHAT_CHANNEL,
+                rawMessage: true,
+                message: "**#${env.BUILD_NUMBER} Pipeline Failure** :sob: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)",
+                avatar: 'https://jenkins.io/images/logos/fire/fire.png'
+              )
+            }
+            always {
+              echo 'Pipeline Completed'
+            }
+          }
+        }
       type: JenkinsPipeline
 - apiVersion: v1
   kind: ConfigMap
@@ -275,19 +470,19 @@ objects:
           - /bin/bash
           - -x
           - -c
-          - |           
-            # adjust jenkins 
-            oc set resources dc/jenkins --limits=cpu=2,memory=2Gi --requests=cpu=100m,memory=512Mi 
-            oc label dc jenkins app=jenkins --overwrite 
+          - |
+            # adjust jenkins
+            oc set resources dc/jenkins --limits=cpu=2,memory=2Gi --requests=cpu=100m,memory=512Mi
+            oc label dc jenkins app=jenkins --overwrite
 
             # setup dev env
-            oc import-image wildfly --from=openshift/wildfly-120-centos7 --confirm -n ${DEV_PROJECT} 
-            
+            oc import-image wildfly --from=openshift/wildfly-120-centos7 --confirm -n ${DEV_PROJECT}
+
             if [ "${ENABLE_QUAY}" == "true" ] ; then
               # cicd
               oc create secret generic quay-cicd-secret --from-literal="username=${QUAY_USERNAME}" --from-literal="password=${QUAY_PASSWORD}" -n ${CICD_NAMESPACE}
               oc label secret quay-cicd-secret credential.sync.jenkins.openshift.io=true -n ${CICD_NAMESPACE}
-              
+
               # dev
               oc create secret docker-registry quay-cicd-secret --docker-server=quay.io --docker-username="${QUAY_USERNAME}" --docker-password="${QUAY_PASSWORD}" --docker-email=cicd@redhat.com -n ${DEV_PROJECT}
               oc new-build --name=tasks --image-stream=wildfly:latest --binary=true --push-secret=quay-cicd-secret --to-docker --to='quay.io/${QUAY_USERNAME}/${QUAY_REPOSITORY}:latest' -n ${DEV_PROJECT}
@@ -296,7 +491,7 @@ objects:
               oc patch dc tasks -p '{"spec": {"template": {"spec": {"containers": [{"name": "tasks", "imagePullPolicy": "Always"}]}}}}' -n ${DEV_PROJECT}
               oc delete is tasks -n ${DEV_PROJECT}
               oc secrets link default quay-cicd-secret --for=pull -n ${DEV_PROJECT}
-              
+
               # stage
               oc create secret docker-registry quay-cicd-secret --docker-server=quay.io --docker-username="${QUAY_USERNAME}" --docker-password="${QUAY_PASSWORD}" --docker-email=cicd@redhat.com -n ${STAGE_PROJECT}
               oc new-app --name=tasks --docker-image=quay.io/${QUAY_USERNAME}/${QUAY_REPOSITORY}:stage --allow-missing-images --as-deployment-config -n ${STAGE_PROJECT}
@@ -304,17 +499,29 @@ objects:
               oc patch dc tasks -p '{"spec": {"template": {"spec": {"containers": [{"name": "tasks", "imagePullPolicy": "Always"}]}}}}' -n ${STAGE_PROJECT}
               oc delete is tasks -n ${STAGE_PROJECT}
               oc secrets link default quay-cicd-secret --for=pull -n ${STAGE_PROJECT}
+
+              # prod
+              oc create secret docker-registry quay-cicd-secret --docker-server=quay.io --docker-username="${QUAY_USERNAME}" --docker-password="${QUAY_PASSWORD}" --docker-email=cicd@redhat.com -n ${PROD_PROJECT}
+              oc new-app --name=tasks --docker-image=quay.io/${QUAY_USERNAME}/${QUAY_REPOSITORY}:prod --allow-missing-images --as-deployment-config -n ${PROD_PROJECT}
+              oc set triggers dc tasks --remove-all -n ${PROD_PROJECT}
+              oc patch dc tasks -p '{"spec": {"template": {"spec": {"containers": [{"name": "tasks", "imagePullPolicy": "Always"}]}}}}' -n ${PROD_PROJECT}
+              oc delete is tasks -n ${PROD_PROJECT}
+              oc secrets link default quay-cicd-secret --for=pull -n ${PROD_PROJECT}
             else
               # dev
               oc new-build --name=tasks --image-stream=wildfly:latest --binary=true -n ${DEV_PROJECT}
               oc new-app tasks:latest --allow-missing-images --as-deployment-config -n ${DEV_PROJECT}
               oc set triggers dc -l app=tasks --containers=tasks --from-image=tasks:latest --manual -n ${DEV_PROJECT}
-              
+
               # stage
               oc new-app tasks:stage --allow-missing-images --as-deployment-config -n ${STAGE_PROJECT}
               oc set triggers dc -l app=tasks --containers=tasks --from-image=tasks:stage --manual -n ${STAGE_PROJECT}
+
+              # prod
+              oc new-app tasks:prod --allow-missing-images --as-deployment-config -n ${PROD_PROJECT}
+              oc set triggers dc -l app=tasks --containers=tasks --from-image=tasks:prod --manual -n ${PROD_PROJECT}
             fi
-            
+
             # dev project
             oc expose dc/tasks --port=8080 -n ${DEV_PROJECT}
             oc expose svc/tasks -n ${DEV_PROJECT}
@@ -327,121 +534,128 @@ objects:
             oc expose svc/tasks -n ${STAGE_PROJECT}
             oc set probe dc/tasks --readiness --get-url=http://:8080/ws/demo/healthcheck --initial-delay-seconds=30 --failure-threshold=10 --period-seconds=10 -n ${STAGE_PROJECT}
             oc set probe dc/tasks --liveness  --get-url=http://:8080/ws/demo/healthcheck --initial-delay-seconds=180 --failure-threshold=10 --period-seconds=10 -n ${STAGE_PROJECT}
+            oc rollout cancel dc/tasks -n ${PROD_PROJECT}
+
+            # prod project
+            oc expose dc/tasks --port=8080 -n ${PROD_PROJECT}
+            oc expose svc/tasks -n ${PROD_PROJECT}
+            oc set probe dc/tasks --readiness --get-url=http://:8080/ws/demo/healthcheck --initial-delay-seconds=30 --failure-threshold=10 --period-seconds=10 -n ${PROD_PROJECT}
+            oc set probe dc/tasks --liveness  --get-url=http://:8080/ws/demo/healthcheck --initial-delay-seconds=180 --failure-threshold=10 --period-seconds=10 -n ${PROD_PROJECT}
             oc rollout cancel dc/tasks -n ${DEV_PROJECT}
 
             # deploy gogs
-            HOSTNAME=$(oc get route jenkins -o template --template='{{.spec.host}}' | sed "s/jenkins-${CICD_NAMESPACE}.//g")
-            GOGS_HOSTNAME="gogs-$CICD_NAMESPACE.$HOSTNAME"
+            # HOSTNAME=$(oc get route jenkins -o template --template='{{.spec.host}}' | sed "s/jenkins-${CICD_NAMESPACE}.//g")
+            # GOGS_HOSTNAME="gogs-$CICD_NAMESPACE.$HOSTNAME"
 
-            if [ "${EPHEMERAL}" == "true" ] ; then
-              oc new-app -f https://raw.githubusercontent.com/siamaksade/gogs/master/gogs-template-ephemeral.yaml \
-                  --param=GOGS_VERSION=0.11.34 \
-                  --param=HOSTNAME=$GOGS_HOSTNAME \
-                  --param=SKIP_TLS_VERIFY=true
-            else
-              oc new-app -f https://raw.githubusercontent.com/siamaksade/gogs/master/gogs-template.yaml \
-                  --param=GOGS_VERSION=0.11.34 \
-                  --param=HOSTNAME=$GOGS_HOSTNAME \
-                  --param=SKIP_TLS_VERIFY=true
-            fi
-            
+            # if [ "${EPHEMERAL}" == "true" ] ; then
+            #   oc new-app -f https://raw.githubusercontent.com/siamaksade/gogs/master/gogs-template-ephemeral.yaml \
+            #       --param=GOGS_VERSION=0.11.34 \
+            #       --param=HOSTNAME=$GOGS_HOSTNAME \
+            #       --param=SKIP_TLS_VERIFY=true
+            # else
+            #   oc new-app -f https://raw.githubusercontent.com/siamaksade/gogs/master/gogs-template.yaml \
+            #       --param=GOGS_VERSION=0.11.34 \
+            #       --param=HOSTNAME=$GOGS_HOSTNAME \
+            #       --param=SKIP_TLS_VERIFY=true
+            # fi
+
             sleep 5
 
-            if [ "${EPHEMERAL}" == "true" ] ; then
-              oc process -f https://raw.githubusercontent.com/siamaksade/sonarqube/8/sonarqube-template.yaml | oc create -f -
-            else
-              oc process -f https://raw.githubusercontent.com/siamaksade/sonarqube/8/sonarqube-persistent-template.yaml | oc create -f -
-            fi
+            # if [ "${EPHEMERAL}" == "true" ] ; then
+            #   oc process -f https://raw.githubusercontent.com/siamaksade/sonarqube/8/sonarqube-template.yaml | oc create -f -
+            # else
+            #   oc process -f https://raw.githubusercontent.com/siamaksade/sonarqube/8/sonarqube-persistent-template.yaml | oc create -f -
+            # fi
 
-            oc set resources dc/sonarqube --limits=cpu=1,memory=2.5Gi --requests=cpu=200m,memory=512Mi
+            # oc set resources dc/sonarqube --limits=cpu=1,memory=2.5Gi --requests=cpu=200m,memory=512Mi
 
-            if [ "${EPHEMERAL}" == "true" ] ; then
-              oc new-app -f https://raw.githubusercontent.com/OpenShiftDemos/nexus/master/nexus3-template.yaml --param=NEXUS_VERSION=3.13.0 --param=MAX_MEMORY=2Gi
-            else
-              oc new-app -f https://raw.githubusercontent.com/OpenShiftDemos/nexus/master/nexus3-persistent-template.yaml --param=NEXUS_VERSION=3.13.0 --param=MAX_MEMORY=2Gi
-            fi
+            # if [ "${EPHEMERAL}" == "true" ] ; then
+            #   oc new-app -f https://raw.githubusercontent.com/OpenShiftDemos/nexus/master/nexus3-template.yaml --param=NEXUS_VERSION=3.13.0 --param=MAX_MEMORY=2Gi
+            # else
+            #   oc new-app -f https://raw.githubusercontent.com/OpenShiftDemos/nexus/master/nexus3-persistent-template.yaml --param=NEXUS_VERSION=3.13.0 --param=MAX_MEMORY=2Gi
+            # fi
 
-            oc set resources dc/nexus --requests=cpu=200m --limits=cpu=2
+            # oc set resources dc/nexus --requests=cpu=200m --limits=cpu=2
 
-            GOGS_SVC=$(oc get svc gogs -o template --template='{{.spec.clusterIP}}')
-            GOGS_USER=gogs
-            GOGS_PWD=gogs
+            # GOGS_SVC=$(oc get svc gogs -o template --template='{{.spec.clusterIP}}')
+            # GOGS_USER=gogs
+            # GOGS_PWD=gogs
 
-            oc rollout status dc gogs
+            # oc rollout status dc gogs
 
             # Even though the rollout is complete gogs isn't always ready to create the admin user
-            sleep 10
+            # sleep 10
 
             # Try 10 times to create the admin user. Fail after that.
-            for i in {1..10};
-            do
+            # for i in {1..10};
+            # do
 
-              _RETURN=$(curl -o /tmp/curl.log -sL --post302 -w "%{http_code}" http://$GOGS_SVC:3000/user/sign_up \
-                --form user_name=$GOGS_USER \
-                --form password=$GOGS_PWD \
-                --form retype=$GOGS_PWD \
-                --form email=admin@gogs.com)
+            #   _RETURN=$(curl -o /tmp/curl.log -sL --post302 -w "%{http_code}" http://$GOGS_SVC:3000/user/sign_up \
+            #     --form user_name=$GOGS_USER \
+            #     --form password=$GOGS_PWD \
+            #     --form retype=$GOGS_PWD \
+            #     --form email=admin@gogs.com)
 
-              if [ $_RETURN == "200" ] || [ $_RETURN == "302" ]
-              then
-                echo "SUCCESS: Created gogs admin user"
-                break
-              elif [ $_RETURN != "200" ] && [ $_RETURN != "302" ] && [ $i == 10 ]; then
-                echo "ERROR: Failed to create Gogs admin"
-                cat /tmp/curl.log
-                exit 255
-              fi
+            #   if [ $_RETURN == "200" ] || [ $_RETURN == "302" ]
+            #   then
+            #     echo "SUCCESS: Created gogs admin user"
+            #     break
+            #   elif [ $_RETURN != "200" ] && [ $_RETURN != "302" ] && [ $i == 10 ]; then
+            #     echo "ERROR: Failed to create Gogs admin"
+            #     cat /tmp/curl.log
+            #     exit 255
+            #   fi
 
               # Sleep between each attempt
-              sleep 10
+            #   sleep 10
 
-            done
+            # done
 
 
-            cat <<EOF > /tmp/data.json
-            {
-              "clone_addr": "https://github.com/OpenShiftDemos/openshift-tasks.git",
-              "uid": 1,
-              "repo_name": "openshift-tasks"
-            }
-            EOF
+            # cat <<EOF > /tmp/data.json
+            # {
+            #   "clone_addr": "https://github.com/OpenShiftDemos/openshift-tasks.git",
+            #   "uid": 1,
+            #   "repo_name": "openshift-tasks"
+            # }
+            # EOF
 
-            _RETURN=$(curl -o /tmp/curl.log -sL -w "%{http_code}" -H "Content-Type: application/json" \
-            -u $GOGS_USER:$GOGS_PWD -X POST http://$GOGS_SVC:3000/api/v1/repos/migrate -d @/tmp/data.json)
+            # _RETURN=$(curl -o /tmp/curl.log -sL -w "%{http_code}" -H "Content-Type: application/json" \
+            # -u $GOGS_USER:$GOGS_PWD -X POST http://$GOGS_SVC:3000/api/v1/repos/migrate -d @/tmp/data.json)
 
-            if [ $_RETURN != "201" ] ;then
-              echo "ERROR: Failed to import openshift-tasks GitHub repo"
-              cat /tmp/curl.log
-              exit 255
-            fi
+            # if [ $_RETURN != "201" ] ;then
+            #   echo "ERROR: Failed to import openshift-tasks GitHub repo"
+            #   cat /tmp/curl.log
+            #   exit 255
+            # fi
 
-            sleep 5
+            # sleep 5
 
-            cat <<EOF > /tmp/data.json
-            {
-              "type": "gogs",
-              "config": {
-                "url": "https://openshift.default.svc.cluster.local/apis/build.openshift.io/v1/namespaces/$CICD_NAMESPACE/buildconfigs/tasks-pipeline/webhooks/${WEBHOOK_SECRET}/generic",
-                "content_type": "json"
-              },
-              "events": [
-                "push"
-              ],
-              "active": true
-            }
-            EOF
+            # cat <<EOF > /tmp/data.json
+            # {
+            #   "type": "gogs",
+            #   "config": {
+            #     "url": "https://openshift.default.svc.cluster.local/apis/build.openshift.io/v1/namespaces/$CICD_NAMESPACE/buildconfigs/tasks-pipeline/webhooks/${WEBHOOK_SECRET}/generic",
+            #     "content_type": "json"
+            #   },
+            #   "events": [
+            #     "push"
+            #   ],
+            #   "active": true
+            # }
+            # EOF
 
-            _RETURN=$(curl -o /tmp/curl.log -sL -w "%{http_code}" -H "Content-Type: application/json" \
-            -u $GOGS_USER:$GOGS_PWD -X POST http://$GOGS_SVC:3000/api/v1/repos/gogs/openshift-tasks/hooks -d @/tmp/data.json)
+            # _RETURN=$(curl -o /tmp/curl.log -sL -w "%{http_code}" -H "Content-Type: application/json" \
+            # -u $GOGS_USER:$GOGS_PWD -X POST http://$GOGS_SVC:3000/api/v1/repos/gogs/openshift-tasks/hooks -d @/tmp/data.json)
 
-            if [ $_RETURN != "201" ] ; then
-              echo "ERROR: Failed to set webhook"
-              cat /tmp/curl.log
-              exit 255
-            fi
+            # if [ $_RETURN != "201" ] ; then
+            #   echo "ERROR: Failed to set webhook"
+            #   cat /tmp/curl.log
+            #   exit 255
+            # fi
 
             oc label dc jenkins "app.kubernetes.io/part-of"="jenkins" --overwrite
-            oc label dc nexus "app.kubernetes.io/part-of"="nexus" --overwrite
+            # oc label dc nexus "app.kubernetes.io/part-of"="nexus" --overwrite
           image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
           name: cicd-demo-installer-job
           resources: {}
