@@ -83,293 +83,100 @@ objects:
     strategy:
       jenkinsPipelineStrategy:
         env:
-          - name: APP_NAME
-            value: tasks
-          - name: CHECKMARX_GROUP
-            value: 22222222-2222-448d-b029-989c9070eb23
-          - name: CHECKMARX_URL
-            value: 'https://checkmarx-cxsast.demo-dlt.com/'
-          - name: DEV_PROJECT
-            value: dev-dlt-ssf
-          - name: DOCUMENT_SITE
-            value: 'true'
-          - name: GIT_BRANCH
-            value: master
-          - name: GIT_URL
-            value: 'https://github-enterprise.demo-dlt.com/user2/openshift-tasks.git'
-          - name: STAGE_PROJECT
-            value: stage-dlt-ssf
-          - name: ENABLE_QUAY
-            value: 'false'
-          - name: ROCKET_CHAT_CHANNEL
-            value: user2-builds
-          - name: ROCKET_CHAT_URL
-            value: 'http://rocketchat-rocketchat-rocket-chat.apps.dltssf2.workshop-dlt.com'
-          - name: USER
-            value: user2
-          jenkinsfile: |-
-            def mvnCmd = "mvn --batch-mode -s configuration/cicd-settings-nexus3.xml -Duser=${env.USER}"
-
-            pipeline {
-              agent {
-                label 'maven'
+        - name: DEV_PROJECT
+          value: ${DEV_PROJECT}
+        - name: STAGE_PROJECT
+          value: ${STAGE_PROJECT}
+        - name: ENABLE_QUAY
+          value: ${ENABLE_QUAY}
+        jenkinsfile: |-
+          def mvnCmd = "mvn -s configuration/cicd-settings-nexus3.xml"
+          pipeline {
+            agent {
+              label 'maven'
+            }
+            stages {
+              stage('Build App') {
+                steps {
+                  git branch: 'eap-7', url: 'http://gogs:3000/gogs/openshift-tasks.git'
+                  sh "${mvnCmd} install -DskipTests=true"
+                }
               }
-              options {
-                timeout(time: 20, unit: 'MINUTES')
+              stage('Test') {
+                steps {
+                  sh "${mvnCmd} test"
+                  step([$class: 'JUnitResultArchiver', testResults: '**/target/surefire-reports/TEST-*.xml'])
+                }
               }
-              parameters {
-                credentials(
-                  credentialType: 'com.openshift.jenkins.plugins.OpenShiftTokenCredentials',
-                  defaultValue: "openshift-${env.USER}",
-                  description: 'OpenShift Credential for User',
-                  name: 'OPENSHIFT_USER_CRED',
-                  required: true
-                )
+              stage('Code Analysis') {
+                steps {
+                  script {
+                    sh "${mvnCmd} install sonar:sonar -Dsonar.host.url=http://sonarqube:9000 -DskipTests=true"
+                  }
+                }
               }
-              stages {
-                stage('Initialize Pipeline') {
-                  steps {
-                    echo 'Initialize Pipeline'
-                    rocketSend(
-                      serverUrl: env.ROCKET_CHAT_URL,
-                      channel: env.ROCKET_CHAT_CHANNEL,
-                      rawMessage: true,
-                      message: "**#${env.BUILD_NUMBER} Pipeline Started** :exclamation: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)"
-                    )
-                  }
+              stage('Archive App') {
+                steps {
+                  sh "${mvnCmd} deploy -DskipTests=true -P nexus3"
                 }
-                stage('Maven: Build WAR') {
-                  steps {
-                    echo 'Maven: Build WAR'
-                    sh "git config --global http.sslVerify false"
-                    git(
-                      branch: env.GIT_BRANCH,
-                      credentialsId: "github-${env.USER}",
-                      url: env.GIT_URL
-                    )
-                    sh "${mvnCmd} install -DskipTests=true"
-                  }
-                }
-                stage('Maven: Unit Test') {
-                  steps {
-                    echo 'Maven: Unit Test'
-                    sh "${mvnCmd} test"
-                    junit(
-                      allowEmptyResults: true,
-                      testResults: '**/target/surefire-reports/TEST-*.xml'
-                    )
-                  }
-                }
-                stage('Analyze') {
-                  parallel {
-                    stage('Checkmarx SAST: Analyze Code') {
-                      steps {
-                        echo 'Checkmarx SAST: Analyze Code'
-                        step([
-                          $class: 'CxScanBuilder',
-                          credentialsId: "checkmarx-${env.USER}",
-                          exclusionsSetting: 'global',
-                          failBuildOnNewResults: false,
-                          failBuildOnNewSeverity: 'HIGH',
-                          fullScanCycle: 10,
-                          generatePdfReport: true,
-                          groupId: env.CHECKMARX_GROUP,
-                          isProxy: false,
-                          preset: '36',
-                          projectName: "${env.APP_NAME}-${env.DEV_PROJECT}",
-                          sastEnabled: true,
-                          serverUrl: env.CHECKMARX_URL,
-                          sourceEncoding: '1',
-                          useOwnServerCredentials: true,
-                          vulnerabilityThresholdResult: 'FAILURE',
-                          waitForResultsEnabled: true
-                        ])
-                        archiveArtifacts 'Checkmarx/Reports/*.pdf'
-                      }
-                    }
-                    stage('Nexus IQ: Analyze BOM') {
-                      steps {
-                        echo 'Nexus IQ: Analyze BOM'
-                        nexusPolicyEvaluation(
-                          enableDebugLogging: true,
-                          failBuildOnNetworkError: false,
-                          iqApplication: "${env.APP_NAME}-${env.DEV_PROJECT}",
-                          iqScanPatterns: [[scanPattern: '**/*.*']],
-                          iqStage: 'build',
-                          jobCredentialsId: "nexus_iq_${env.USER}"
-                        )
-                      }
-                    }
-                    stage('Maven: Document Site') {
-                      steps {
-                        script {
-                          if (env.DOCUMENT_SITE.toBoolean()) {
-                            echo 'Maven: Document Site'
-                            sh "${mvnCmd} jxr:jxr site:site -DskipTests=true"
-                            publishHTML(target: [
-                              reportName: 'Site',
-                              reportDir: 'target/site/apidocs',
-                              reportFiles: 'index-all.html',
-                              keepAll: false
-                            ])
-                          } else {
-                            echo 'Maven: Document Site - skipped'
-                          }
-                        }
+              }
+              stage('Build Image') {
+                steps {
+                  sh "cp target/openshift-tasks.war target/ROOT.war"
+                  script {
+                    openshift.withCluster() {
+                      openshift.withProject(env.DEV_PROJECT) {
+                        openshift.selector("bc", "tasks").startBuild("--from-file=target/ROOT.war", "--wait=true")
                       }
                     }
                   }
                 }
-                stage('Nexus Repo: Archive WAR') {
-                  steps {
-                    echo 'Nexus Repo: Archive WAR'
-                    sh "${mvnCmd} deploy -DskipTests=true -P nexus"
-                  }
-                }
-                stage('OpenShift: Build/Deploy Image to Dev') {
-                  steps {
-                    echo 'OpenShift: Build/Deploy Image to Dev'
-                    script {
-                      openshift.withCluster() {
-                        openshift.withCredentials("${OPENSHIFT_USER_CRED}") {
-                          openshift.withProject(env.DEV_PROJECT) {
-                            timeout (time: 10, unit: 'MINUTES') {
-                              def bc = openshift.selector('bc', env.APP_NAME)
-                              if (bc.exists()) {
-                                bc.startBuild('--wait=true')
-                              } else {
-                                openshift.create(openshift.process(env.APP_NAME))
-                              }
-                              def dc = openshift.selector('dc', env.APP_NAME)
-                              dc.rollout().status()
-                              dc.related('pods').untilEach {
-                                return it.object().status.phase == 'Running'
-                              }
-                            }
-                          }
-                        }
+              }
+              stage('Deploy DEV') {
+                steps {
+                  script {
+                    openshift.withCluster() {
+                      openshift.withProject(env.DEV_PROJECT) {
+                        openshift.selector("dc", "tasks").rollout().latest();
                       }
                     }
-                    rocketSend(
-                      serverUrl: env.ROCKET_CHAT_URL,
-                      channel: env.ROCKET_CHAT_CHANNEL,
-                      rawMessage: true,
-                      message: "**#${env.BUILD_NUMBER} Deployed to <http://${env.APP_NAME}-${env.DEV_PROJECT}.apps.dltssf2.workshop-dlt.com/|Dev>** :thumbsup: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)"
-                    )
                   }
                 }
-                stage('Sysdig: Scan Image') {
-                  steps {
-                    echo 'Sysdig: Scan Image'
-                    writeFile(
-                      file: "sysdig_secure_images",
-                      text: "image-registry.openshift-image-registry.svc:5000/${env.DEV_PROJECT}/${env.APP_NAME}:latest"
-                    )
-                    sysdig(
-                      bailOnFail: false,
-                      engineCredentialsId: "sysdig-secure-api-credentials",
-                      name: "sysdig_secure_images"
-                    )
-                  }
+              }
+              stage('Promote to STAGE?') {
+                agent {
+                  label 'skopeo'
                 }
-                stage('Jenkins: Promote to Stage?') {
-                  agent {
-                    label 'skopeo'
-                  }
-                  steps {
-                    echo 'Jenkins: Promote to Stage?'
-                    rocketSend(
-                      serverUrl: env.ROCKET_CHAT_URL,
-                      channel: env.ROCKET_CHAT_CHANNEL,
-                      rawMessage: true,
-                      message: "**#${env.BUILD_NUMBER} Dev Pipeline Complete - Promote to Stage?** :question: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)"
-                    )
-                    timeout(time:15, unit:'MINUTES') {
+                steps {
+                  timeout(time:15, unit:'MINUTES') {
                       input message: "Promote to STAGE?", ok: "Promote"
-                    }
-
-                    script {
-                      openshift.withCluster() {
-                        if (env.ENABLE_QUAY.toBoolean()) {
-                          withCredentials([usernamePassword(credentialsId: "${openshift.project()}-quay-cicd-secret", usernameVariable: "QUAY_USER", passwordVariable: "QUAY_PWD")]) {
-                            sh "skopeo copy docker://quay.io//${env.APP_NAME}-app:latest docker://quay.io//${env.APP_NAME}-app:stage --src-creds \"$QUAY_USER:$QUAY_PWD\" --dest-creds \"$QUAY_USER:$QUAY_PWD\" --src-tls-verify=false --dest-tls-verify=false"
-                          }
-                        } else {
-                          openshift.tag("${env.DEV_PROJECT}/${env.APP_NAME}:latest", "${env.STAGE_PROJECT}/${env.APP_NAME}:stage")
-                        }
-                      }
-                    }
                   }
-                }
-                stage('OpenShift: Deploy to Stage') {
-                  steps {
-                    echo 'OpenShift: Deploy to Stage'
-                    script {
-                      openshift.withCluster() {
-                        openshift.withCredentials("${OPENSHIFT_USER_CRED}") {
-                          openshift.withProject(env.STAGE_PROJECT) {
-                            def dc = openshift.selector('dc', env.APP_NAME)
-                            dc.rollout().status()
-                            dc.related('pods').untilEach {
-                              return it.object().status.phase == 'Running'
-                            }
-                          }
+                  script {
+                    openshift.withCluster() {
+                      if (env.ENABLE_QUAY.toBoolean()) {
+                        withCredentials([usernamePassword(credentialsId: "${openshift.project()}-quay-cicd-secret", usernameVariable: "QUAY_USER", passwordVariable: "QUAY_PWD")]) {
+                          sh "skopeo copy docker://quay.io/${QUAY_USERNAME}/${QUAY_REPOSITORY}:latest docker://quay.io/${QUAY_USERNAME}/${QUAY_REPOSITORY}:stage --src-creds \"$QUAY_USER:$QUAY_PWD\" --dest-creds \"$QUAY_USER:$QUAY_PWD\" --src-tls-verify=false --dest-tls-verify=false"
                         }
+                      } else {
+                        openshift.tag("${env.DEV_PROJECT}/tasks:latest", "${env.STAGE_PROJECT}/tasks:stage")
                       }
                     }
-                    rocketSend(
-                      serverUrl: env.ROCKET_CHAT_URL,
-                      channel: env.ROCKET_CHAT_CHANNEL,
-                      rawMessage: true,
-                      message: "**#${env.BUILD_NUMBER} Deployed to <http://${env.APP_NAME}-${env.STAGE_PROJECT}.apps.dltssf2.workshop-dlt.com/|Stage>** :thumbsup: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)"
-                    )
                   }
                 }
               }
-              post {
-                success {
-                  echo 'Pipeline Success'
-                  rocketSend(
-                    serverUrl: env.ROCKET_CHAT_URL,
-                    channel: env.ROCKET_CHAT_CHANNEL,
-                    rawMessage: true,
-                    message: "**#${env.BUILD_NUMBER} Pipeline Success** :100: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)"
-                  )
-                }
-                aborted {
-                  echo 'Pipeline Aborted'
-                  rocketSend(
-                    serverUrl: env.ROCKET_CHAT_URL,
-                    channel: env.ROCKET_CHAT_CHANNEL,
-                    rawMessage: true,
-                    message: "**#${env.BUILD_NUMBER} Pipeline Aborted** :no_entry_sign: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)"
-                  )
-                }
-                unstable {
-                  echo 'Pipeline Unstable'
-                  rocketSend(
-                    serverUrl: env.ROCKET_CHAT_URL,
-                    channel: env.ROCKET_CHAT_CHANNEL,
-                    rawMessage: true,
-                    message: "**#${env.BUILD_NUMBER} Pipeline Unstable** :confused: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)",
-                    avatar: 'https://jenkins.io/images/logos/fire/fire.png'
-                  )
-                }
-                failure {
-                  echo 'Pipeline Failure'
-                  rocketSend(
-                    serverUrl: env.ROCKET_CHAT_URL,
-                    channel: env.ROCKET_CHAT_CHANNEL,
-                    rawMessage: true,
-                    message: "**#${env.BUILD_NUMBER} Pipeline Failure** :sob: ${env.JOB_NAME} (<${env.BUILD_URL}display/redirect|Open>)",
-                    avatar: 'https://jenkins.io/images/logos/fire/fire.png'
-                  )
-                }
-                always {
-                  echo 'Pipeline Completed'
+              stage('Deploy STAGE') {
+                steps {
+                  script {
+                    openshift.withCluster() {
+                      openshift.withProject(env.STAGE_PROJECT) {
+                        openshift.selector("dc", "tasks").rollout().latest();
+                      }
+                    }
+                  }
                 }
               }
             }
+          }
       type: JenkinsPipeline
 - apiVersion: v1
   kind: ConfigMap
